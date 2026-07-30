@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
 JustOVPN - OpenVPN Config Manager
-Auto-cert generation, real-time status, start/stop controls
+Auto-cert, real-time status, separate running profiles list
 """
-import os
-import sys
-import subprocess
-import shutil
-import time
-import zipfile
-import signal
+import os, sys, subprocess, shutil, time, zipfile, signal
 from pathlib import Path
 from datetime import datetime
 
@@ -25,16 +19,12 @@ except ImportError:
 def get_public_ip():
     try:
         ip = subprocess.check_output(["curl", "-s", "ifconfig.me"], text=True).strip()
-        if ip:
-            return ip
-    except:
-        pass
+        if ip: return ip
+    except: pass
     try:
         ip = subprocess.check_output(["hostname", "-I"], text=True).strip().split()[0]
-        if ip:
-            return ip
-    except:
-        pass
+        if ip: return ip
+    except: pass
     return "vpn.example.com"
 
 PUBLIC_IP = get_public_ip()
@@ -45,7 +35,6 @@ CONFIG_DIR = BASE_DIR / "configs"
 CERT_DIR = BASE_DIR / "certs"
 PID_DIR = Path("/var/run/ovpn_manager")
 LOG_DIR = Path("/var/log/ovpn_manager")
-
 for d in [BASE_DIR, CONFIG_DIR, CERT_DIR, PID_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -57,55 +46,25 @@ OPENVPN_BIN = shutil.which("openvpn") or "/usr/sbin/openvpn"
 def ensure_ca():
     ca_key = CERT_DIR / "ca.key"
     ca_crt = CERT_DIR / "ca.crt"
-    server_key = CERT_DIR / "server.key"
-    server_crt = CERT_DIR / "server.crt"
     if ca_key.exists() and ca_crt.exists():
         return
-    print("🔐 Generating CA and server certificates...", file=sys.stderr)
-    subprocess.run([
-        "openssl", "req", "-new", "-x509", "-days", "3650", "-nodes",
-        "-newkey", "rsa:2048",
-        "-keyout", str(ca_key),
-        "-out", str(ca_crt),
-        "-subj", "/C=XX/ST=State/L=City/O=Organization/CN=JustOVPN-CA"
-    ], check=True, stderr=subprocess.DEVNULL)
-    subprocess.run([
-        "openssl", "req", "-new", "-nodes",
-        "-newkey", "rsa:2048",
-        "-keyout", str(server_key),
-        "-out", str(CERT_DIR / "server.csr"),
-        "-subj", "/C=XX/ST=State/L=City/O=Organization/CN=justovpn-server"
-    ], check=True, stderr=subprocess.DEVNULL)
-    subprocess.run([
-        "openssl", "x509", "-req", "-days", "3650",
-        "-in", str(CERT_DIR / "server.csr"),
-        "-CA", str(ca_crt),
-        "-CAkey", str(ca_key),
-        "-set_serial", "01",
-        "-out", str(server_crt)
-    ], check=True, stderr=subprocess.DEVNULL)
-    (CERT_DIR / "server.csr").unlink(missing_ok=True)
+    print("🔐 Generating CA...", file=sys.stderr)
+    subprocess.run(["openssl", "req", "-new", "-x509", "-days", "3650", "-nodes",
+                    "-newkey", "rsa:2048", "-keyout", str(ca_key), "-out", str(ca_crt),
+                    "-subj", "/C=XX/ST=State/L=City/O=Organization/CN=JustOVPN-CA"], check=True, stderr=subprocess.DEVNULL)
 
 def generate_client_cert(common_name):
     client_key = CERT_DIR / f"{common_name}.key"
     client_crt = CERT_DIR / f"{common_name}.crt"
     if client_key.exists() and client_crt.exists():
         return client_crt.read_text(), client_key.read_text()
-    subprocess.run([
-        "openssl", "req", "-new", "-nodes",
-        "-newkey", "rsa:2048",
-        "-keyout", str(client_key),
-        "-out", str(CERT_DIR / f"{common_name}.csr"),
-        "-subj", f"/C=XX/ST=State/L=City/O=Organization/CN={common_name}"
-    ], check=True, stderr=subprocess.DEVNULL)
-    subprocess.run([
-        "openssl", "x509", "-req", "-days", "3650",
-        "-in", str(CERT_DIR / f"{common_name}.csr"),
-        "-CA", str(CERT_DIR / "ca.crt"),
-        "-CAkey", str(CERT_DIR / "ca.key"),
-        "-set_serial", "02",
-        "-out", str(client_crt)
-    ], check=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["openssl", "req", "-new", "-nodes", "-newkey", "rsa:2048",
+                    "-keyout", str(client_key), "-out", str(CERT_DIR / f"{common_name}.csr"),
+                    "-subj", f"/C=XX/ST=State/L=City/O=Organization/CN={common_name}"], check=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["openssl", "x509", "-req", "-days", "3650",
+                    "-in", str(CERT_DIR / f"{common_name}.csr"),
+                    "-CA", str(CERT_DIR / "ca.crt"), "-CAkey", str(CERT_DIR / "ca.key"),
+                    "-set_serial", "02", "-out", str(client_crt)], check=True, stderr=subprocess.DEVNULL)
     (CERT_DIR / f"{common_name}.csr").unlink(missing_ok=True)
     return client_crt.read_text(), client_key.read_text()
 
@@ -119,70 +78,48 @@ def get_active_configs():
                 parts = line.split()
                 for i, part in enumerate(parts):
                     if part == "--config" and i+1 < len(parts):
-                        config_path = parts[i+1]
-                        config_name = Path(config_path).stem
+                        config_name = Path(parts[i+1]).stem
                         active.add(config_name)
                         break
-    except Exception:
-        pass
+    except: pass
     return active
 
 # ========== START/STOP VPN ==========
 def start_vpn(config_name):
     config_path = CONFIG_DIR / f"{config_name}.ovpn"
-    if not config_path.exists():
-        return False
-    if config_name in get_active_configs():
-        return True
+    if not config_path.exists() or config_name in get_active_configs():
+        return config_name in get_active_configs()
     pid_file = PID_DIR / f"{config_name}.pid"
     log_file = LOG_DIR / f"{config_name}.log"
-    cmd = [
-        OPENVPN_BIN,
-        "--config", str(config_path),
-        "--daemon",
-        "--writepid", str(pid_file),
-        "--log", str(log_file),
-        "--redirect-gateway", "def1",
-        "--verb", "3"
-    ]
+    cmd = [OPENVPN_BIN, "--config", str(config_path), "--daemon",
+           "--writepid", str(pid_file), "--log", str(log_file), "--redirect-gateway", "def1", "--verb", "3"]
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
         return config_name in get_active_configs()
-    except Exception:
-        return False
+    except: return False
 
 def stop_vpn(config_name):
     pid_file = PID_DIR / f"{config_name}.pid"
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            os.kill(pid, signal.SIGTERM); time.sleep(0.5)
+            try: os.kill(pid, 0); os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
             pid_file.unlink(missing_ok=True)
             return True
-        except Exception:
-            pass
+        except: pass
     try:
         output = subprocess.check_output(["ps", "aux"]).decode()
         for line in output.splitlines():
             if "openvpn" in line and f"--config {CONFIG_DIR}/{config_name}.ovpn" in line:
                 pid = int(line.split()[1])
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.5)
-                try:
-                    os.kill(pid, 0)
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                os.kill(pid, signal.SIGTERM); time.sleep(0.5)
+                try: os.kill(pid, 0); os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
                 return True
-    except Exception:
-        pass
+    except: pass
     return False
 
 # ========== TEMPLATE ==========
@@ -221,7 +158,7 @@ def get_profiles():
     active_set = get_active_configs()
     for ovpn in CONFIG_DIR.glob("*.ovpn"):
         name = ovpn.stem
-        meta = {"name": name, "file": str(ovpn), "size": ovpn.stat().st_size}
+        meta = {"name": name, "size": ovpn.stat().st_size}
         with open(ovpn) as f:
             content = f.read()
             for line in content.splitlines():
@@ -230,71 +167,45 @@ def get_profiles():
                 elif line.startswith("remote "):
                     parts = line.split()
                     if len(parts) >= 3:
-                        meta["server"] = parts[1]
-                        meta["port"] = parts[2]
-        meta.setdefault("proto", "unknown")
-        meta.setdefault("server", "unknown")
-        meta.setdefault("port", "unknown")
+                        meta["server"] = parts[1]; meta["port"] = parts[2]
+        meta.setdefault("proto", "unknown"); meta.setdefault("server", "unknown"); meta.setdefault("port", "unknown")
         meta["active"] = name in active_set
         meta["created"] = datetime.fromtimestamp(ovpn.stat().st_ctime).strftime("%Y-%m-%d %H:%M")
         profiles.append(meta)
     return profiles
 
 def generate_config(name, server, port, proto, cipher, auth, comp, ca_cert, client_cert, client_key):
-    config = TEMPLATE.format(
-        name=name,
-        server=server,
-        port=port,
-        proto=proto,
-        cipher=cipher,
-        auth=auth,
-        comp=comp,
-        date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ca_cert=ca_cert.strip(),
-        client_cert=client_cert.strip(),
-        client_key=client_key.strip()
-    )
+    config = TEMPLATE.format(name=name, server=server, port=port, proto=proto,
+                             cipher=cipher, auth=auth, comp=comp,
+                             date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             ca_cert=ca_cert.strip(), client_cert=client_cert.strip(), client_key=client_key.strip())
     out_file = CONFIG_DIR / f"{name}.ovpn"
-    with open(out_file, "w") as f:
-        f.write(config)
+    out_file.write_text(config)
     return out_file
 
 @app.route('/')
 def index():
     profiles = get_profiles()
-    return render_template_string(HTML, profiles=profiles, public_ip=PUBLIC_IP)
+    running = [p for p in profiles if p["active"]]
+    inactive = [p for p in profiles if not p["active"]]
+    return render_template_string(HTML, running=running, inactive=inactive, public_ip=PUBLIC_IP)
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    server = request.form.get('server', '').strip()
+    server = request.form.get('server', PUBLIC_IP).strip()
     proto = request.form.get('protocol', 'udp')
     ports_raw = request.form.get('ports', '1194').strip()
     cipher = request.form.get('cipher', 'AES-256-CBC')
     auth = request.form.get('auth', 'SHA256')
     comp = request.form.get('comp', 'yes')
     client_name = request.form.get('client_name', 'client').strip()
-    if not server:
-        server = PUBLIC_IP
-    ports = [p.strip() for p in ports_raw.split(',') if p.strip().isdigit()]
-    if not ports:
-        ports = ["1194"]
+    ports = [p.strip() for p in ports_raw.split(',') if p.strip().isdigit()] or ["1194"]
     ensure_ca()
     ca_cert = (CERT_DIR / "ca.crt").read_text()
     for port in ports:
         name = f"{client_name}_{proto}_{port}"
         client_cert_pem, client_key_pem = generate_client_cert(name)
-        generate_config(
-            name=name,
-            server=server,
-            port=port,
-            proto=proto,
-            cipher=cipher,
-            auth=auth,
-            comp=comp,
-            ca_cert=ca_cert,
-            client_cert=client_cert_pem,
-            client_key=client_key_pem
-        )
+        generate_config(name, server, port, proto, cipher, auth, comp, ca_cert, client_cert_pem, client_key_pem)
     return redirect(url_for('index'))
 
 @app.route('/start/<name>')
@@ -310,9 +221,7 @@ def stop_route(name):
 @app.route('/download/<name>')
 def download(name):
     file_path = CONFIG_DIR / f"{name}.ovpn"
-    if not file_path.exists():
-        return "File not found", 404
-    return send_file(file_path, as_attachment=True)
+    return send_file(file_path, as_attachment=True) if file_path.exists() else ("Not found", 404)
 
 @app.route('/download_all')
 def download_all():
@@ -326,12 +235,10 @@ def download_all():
 def delete(name):
     if name in get_active_configs():
         stop_vpn(name)
-    file_path = CONFIG_DIR / f"{name}.ovpn"
-    if file_path.exists():
-        file_path.unlink()
+    (CONFIG_DIR / f"{name}.ovpn").unlink(missing_ok=True)
     return redirect(url_for('index'))
 
-# ---------------- HTML (Clean UI) ----------------
+# ---------------- HTML ----------------
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -354,8 +261,6 @@ HTML = """
         .btn-danger:hover { background: #c0392b; }
         .btn-success { background: #2ecc71; }
         .btn-success:hover { background: #27ae60; }
-        .btn-warning { background: #f39c12; }
-        .btn-warning:hover { background: #e67e22; }
         .file-list { list-style: none; padding: 0; }
         .file-list li { padding: 12px; border-bottom: 1px solid #ecf0f1; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
         .file-info { font-size: 0.9em; color: #7f8c8d; }
@@ -364,6 +269,7 @@ HTML = """
         .badge.inactive { background: #e74c3c; }
         .footer { margin-top: 30px; color: #95a5a6; font-size: 0.9em; border-top: 1px solid #ecf0f1; padding-top: 15px; }
         .note { background: #f9f9f9; padding: 10px; border-left: 4px solid #3498db; margin: 10px 0; }
+        .section-title { margin-top: 25px; }
     </style>
 </head>
 <body>
@@ -380,10 +286,7 @@ HTML = """
                     </div>
                     <div class="form-group">
                         <label>Protocol</label>
-                        <select name="protocol">
-                            <option value="udp">UDP</option>
-                            <option value="tcp">TCP</option>
-                        </select>
+                        <select name="protocol"><option value="udp">UDP</option><option value="tcp">TCP</option></select>
                     </div>
                     <div class="form-group">
                         <label>Ports (comma-separated)</label>
@@ -399,19 +302,11 @@ HTML = """
                     </div>
                     <div class="form-group">
                         <label>Auth</label>
-                        <select name="auth">
-                            <option value="SHA256">SHA256</option>
-                            <option value="SHA512">SHA512</option>
-                            <option value="SHA1">SHA1</option>
-                        </select>
+                        <select name="auth"><option value="SHA256">SHA256</option><option value="SHA512">SHA512</option><option value="SHA1">SHA1</option></select>
                     </div>
                     <div class="form-group">
                         <label>Compression</label>
-                        <select name="comp">
-                            <option value="yes">yes</option>
-                            <option value="no">no</option>
-                            <option value="lzo">lzo</option>
-                        </select>
+                        <select name="comp"><option value="yes">yes</option><option value="no">no</option><option value="lzo">lzo</option></select>
                     </div>
                     <div class="form-group">
                         <label>Client Name (prefix)</label>
@@ -424,26 +319,20 @@ HTML = """
         </div>
         <div class="col">
             <div style="background:#f9f9f9;padding:15px;border-radius:6px;">
-                <h2>📋 Profiles ({{ profiles|length }})</h2>
+                <h2>📋 All Profiles ({{ inactive|length + running|length }})</h2>
                 <div style="margin-bottom:10px;">
                     <a href="/download_all" class="btn btn-success">⬇ Download All (ZIP)</a>
                 </div>
                 <ul class="file-list">
-                    {% for p in profiles %}
+                    {% for p in inactive %}
                     <li>
                         <span>
                             <strong>{{ p.name }}</strong><br>
                             <span class="file-info">{{ p.server }}:{{ p.port }} ({{ p.proto }}) – {{ p.created }} – {{ p.size }} bytes</span>
-                            <span class="badge {% if p.active %}active{% else %}inactive{% endif %}">
-                                {% if p.active %}● ACTIVE{% else %}● INACTIVE{% endif %}
-                            </span>
+                            <span class="badge inactive">● INACTIVE</span>
                         </span>
                         <div class="actions">
-                            {% if p.active %}
-                                <a href="/stop/{{ p.name }}" class="btn btn-danger">⏹ Stop</a>
-                            {% else %}
-                                <a href="/start/{{ p.name }}" class="btn btn-success">▶ Start</a>
-                            {% endif %}
+                            <a href="/start/{{ p.name }}" class="btn btn-success">▶ Start</a>
                             <a href="/download/{{ p.name }}" class="btn">⬇</a>
                             <form method="post" action="/delete/{{ p.name }}" style="display:inline;">
                                 <button class="btn btn-danger" onclick="return confirm('Delete config?')">🗑</button>
@@ -451,7 +340,29 @@ HTML = """
                         </div>
                     </li>
                     {% else %}
-                    <li>No configs yet.</li>
+                    <li>No inactive configs.</li>
+                    {% endfor %}
+                </ul>
+
+                <h2 class="section-title">▶️ Running Profiles ({{ running|length }})</h2>
+                <ul class="file-list">
+                    {% for p in running %}
+                    <li>
+                        <span>
+                            <strong>{{ p.name }}</strong><br>
+                            <span class="file-info">{{ p.server }}:{{ p.port }} ({{ p.proto }}) – {{ p.created }} – {{ p.size }} bytes</span>
+                            <span class="badge">● ACTIVE</span>
+                        </span>
+                        <div class="actions">
+                            <a href="/stop/{{ p.name }}" class="btn btn-danger">⏹ Stop</a>
+                            <a href="/download/{{ p.name }}" class="btn">⬇</a>
+                            <form method="post" action="/delete/{{ p.name }}" style="display:inline;">
+                                <button class="btn btn-danger" onclick="return confirm('Delete config?')">🗑</button>
+                            </form>
+                        </div>
+                    </li>
+                    {% else %}
+                    <li>No running profiles.</li>
                     {% endfor %}
                 </ul>
             </div>
@@ -463,7 +374,6 @@ HTML = """
 </html>
 """
 
-# ========== MAIN ==========
 if __name__ == "__main__":
     if not shutil.which("openssl"):
         subprocess.check_call(["apt-get", "install", "-y", "openssl"])
