@@ -1,41 +1,116 @@
 #!/usr/bin/env python3
 """
-OVPN Config Forge – Web Panel
-ShadowCat Edition – generate, download, and monitor OVPN profiles
+OVPN Config Forge v2 – Auto‑Cert + Clean UI
+ShadowCat Edition – no more manual certs
 """
 import os
 import sys
 import subprocess
 import shutil
-import json
 import time
 import zipfile
+import ssl
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import tempfile
 
-# ===== AUTO‑INSTALL FLASK VIA APT =====
+# ===== AUTO‑INSTALL FLASK AND OPENSSL =====
 try:
     from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
     from werkzeug.utils import secure_filename
 except ImportError:
-    print("🐱 Flask not found. Installing via apt...", file=sys.stderr)
+    print("🐱 Installing Flask...", file=sys.stderr)
     subprocess.check_call(["apt-get", "update"], stderr=subprocess.DEVNULL)
-    subprocess.check_call(["apt-get", "install", "-y", "python3-flask", "python3-werkzeug"])
+    subprocess.check_call(["apt-get", "install", "-y", "python3-flask", "python3-werkzeug", "openssl"])
     from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
     from werkzeug.utils import secure_filename
 
-# ========== CONFIGURATION ==========
+# ========== CONFIG ==========
 BASE_DIR = Path("/opt/ovpn_forge")
-CONFIG_DIR = BASE_DIR / "configs"        # generated .ovpn files
-UPLOAD_DIR = BASE_DIR / "uploads"        # temporary for certs
-PID_DIR = Path("/var/run/ovpn_manager")  # reuse for status checking (optional)
+CONFIG_DIR = BASE_DIR / "configs"
+CERT_DIR = BASE_DIR / "certs"
 LOG_DIR = Path("/var/log/ovpn_manager")
 
-for d in [BASE_DIR, CONFIG_DIR, UPLOAD_DIR, PID_DIR, LOG_DIR]:
+for d in [BASE_DIR, CONFIG_DIR, CERT_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 HOST = "0.0.0.0"
 PORT = 5000
+SERVER_IP = "vpn.example.com"  # user will change in UI
+
+# ========== CERTIFICATE GENERATION ==========
+def ensure_ca():
+    """Generate CA and server certs if missing"""
+    ca_key = CERT_DIR / "ca.key"
+    ca_crt = CERT_DIR / "ca.crt"
+    server_key = CERT_DIR / "server.key"
+    server_crt = CERT_DIR / "server.crt"
+
+    if ca_key.exists() and ca_crt.exists():
+        return  # already exists
+
+    print("🐱 Generating CA and server certificates...", file=sys.stderr)
+    # Generate CA key and cert (10 years)
+    subprocess.run([
+        "openssl", "req", "-new", "-x509", "-days", "3650", "-nodes",
+        "-newkey", "rsa:2048",
+        "-keyout", str(ca_key),
+        "-out", str(ca_crt),
+        "-subj", "/C=XX/ST=State/L=City/O=Organization/CN=ShadowCA"
+    ], check=True, stderr=subprocess.DEVNULL)
+
+    # Generate server key and CSR
+    subprocess.run([
+        "openssl", "req", "-new", "-nodes",
+        "-newkey", "rsa:2048",
+        "-keyout", str(server_key),
+        "-out", str(CERT_DIR / "server.csr"),
+        "-subj", "/C=XX/ST=State/L=City/O=Organization/CN=shadow-server"
+    ], check=True, stderr=subprocess.DEVNULL)
+
+    # Sign server cert with CA
+    subprocess.run([
+        "openssl", "x509", "-req", "-days", "3650",
+        "-in", str(CERT_DIR / "server.csr"),
+        "-CA", str(ca_crt),
+        "-CAkey", str(ca_key),
+        "-set_serial", "01",
+        "-out", str(server_crt)
+    ], check=True, stderr=subprocess.DEVNULL)
+
+    # Cleanup CSR
+    (CERT_DIR / "server.csr").unlink(missing_ok=True)
+    print("🐱 Certificates created.", file=sys.stderr)
+
+def generate_client_cert(common_name):
+    """Generate a client certificate and return (cert_pem, key_pem)"""
+    client_key = CERT_DIR / f"{common_name}.key"
+    client_crt = CERT_DIR / f"{common_name}.crt"
+    if client_key.exists() and client_crt.exists():
+        # reuse existing
+        return client_crt.read_text(), client_key.read_text()
+
+    # Generate client key and CSR
+    subprocess.run([
+        "openssl", "req", "-new", "-nodes",
+        "-newkey", "rsa:2048",
+        "-keyout", str(client_key),
+        "-out", str(CERT_DIR / f"{common_name}.csr"),
+        "-subj", f"/C=XX/ST=State/L=City/O=Organization/CN={common_name}"
+    ], check=True, stderr=subprocess.DEVNULL)
+
+    # Sign client cert with CA
+    subprocess.run([
+        "openssl", "x509", "-req", "-days", "3650",
+        "-in", str(CERT_DIR / f"{common_name}.csr"),
+        "-CA", str(CERT_DIR / "ca.crt"),
+        "-CAkey", str(CERT_DIR / "ca.key"),
+        "-set_serial", "02",
+        "-out", str(client_crt)
+    ], check=True, stderr=subprocess.DEVNULL)
+
+    (CERT_DIR / f"{common_name}.csr").unlink(missing_ok=True)
+    return client_crt.read_text(), client_key.read_text()
 
 # ========== TEMPLATE ==========
 TEMPLATE = """# OpenVPN Client Config – {name}
@@ -68,32 +143,17 @@ verb 3
 
 # ========== FLASK APP ==========
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = str(UPLOAD_DIR)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# ---------------- Helper Functions ----------------
-def get_active_connections():
-    """Return dict of active OpenVPN processes (name -> pid)"""
-    active = {}
-    for pid_file in PID_DIR.glob("*.pid"):
-        try:
-            pid = int(pid_file.read_text().strip())
-            if os.kill(pid, 0) == 0:
-                active[pid_file.stem] = pid
-        except (ProcessLookupError, ValueError, OSError):
-            pass
-    return active
-
-def get_generated_profiles():
-    """Return list of dicts with info about each .ovpn file"""
+# ---------------- Helpers ----------------
+def get_profiles():
+    """List all generated .ovpn files with metadata"""
     profiles = []
-    for ovpn_file in CONFIG_DIR.glob("*.ovpn"):
-        name = ovpn_file.stem
-        # Try to extract metadata from file header
-        meta = {"name": name, "file": str(ovpn_file), "size": ovpn_file.stat().st_size}
-        with open(ovpn_file) as f:
+    for ovpn in CONFIG_DIR.glob("*.ovpn"):
+        name = ovpn.stem
+        meta = {"name": name, "file": str(ovpn), "size": ovpn.stat().st_size}
+        with open(ovpn) as f:
             content = f.read()
-            # Quick parse: look for proto, remote lines
             for line in content.splitlines():
                 if line.startswith("proto "):
                     meta["proto"] = line.split()[1]
@@ -102,18 +162,18 @@ def get_generated_profiles():
                     if len(parts) >= 3:
                         meta["server"] = parts[1]
                         meta["port"] = parts[2]
-        # Defaults if not found
         meta.setdefault("proto", "unknown")
         meta.setdefault("server", "unknown")
         meta.setdefault("port", "unknown")
-        meta["active"] = name in get_active_connections()
-        meta["created"] = datetime.fromtimestamp(ovpn_file.stat().st_ctime).strftime("%Y-%m-%d %H:%M")
+        # Check if active (simple: check for openvpn process with this config)
+        # For simplicity, we'll mark as active if any openvpn is running (not robust)
+        # We'll skip active detection for now to keep it simple.
+        meta["active"] = False  # placeholder
+        meta["created"] = datetime.fromtimestamp(ovpn.stat().st_ctime).strftime("%Y-%m-%d %H:%M")
         profiles.append(meta)
     return profiles
 
-def generate_config(server, port, proto, name, ca_cert, client_cert, client_key,
-                    cipher="AES-256-CBC", auth="SHA256", comp="yes"):
-    """Write a .ovpn file to CONFIG_DIR and return its path"""
+def generate_config(name, server, port, proto, cipher, auth, comp, ca_cert, client_cert, client_key):
     config = TEMPLATE.format(
         name=name,
         server=server,
@@ -123,9 +183,9 @@ def generate_config(server, port, proto, name, ca_cert, client_cert, client_key,
         auth=auth,
         comp=comp,
         date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ca_cert=ca_cert.strip() if ca_cert else "PASTE YOUR CA CERT HERE",
-        client_cert=client_cert.strip() if client_cert else "PASTE YOUR CLIENT CERT HERE",
-        client_key=client_key.strip() if client_key else "PASTE YOUR CLIENT KEY HERE"
+        ca_cert=ca_cert.strip(),
+        client_cert=client_cert.strip(),
+        client_key=client_key.strip()
     )
     out_file = CONFIG_DIR / f"{name}.ovpn"
     with open(out_file, "w") as f:
@@ -135,54 +195,49 @@ def generate_config(server, port, proto, name, ca_cert, client_cert, client_key,
 # ---------------- Routes ----------------
 @app.route('/')
 def index():
-    profiles = get_generated_profiles()
-    return render_template_string(HTML, profiles=profiles)
+    profiles = get_profiles()
+    return render_template_string(HTML, profiles=profiles, server_ip=SERVER_IP)
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    # Get form data
     server = request.form.get('server', '').strip()
-    protocols = request.form.getlist('protocols')  # list
-    ports_raw = request.form.get('ports', '1194,443').strip()
+    proto = request.form.get('protocol', 'udp')
+    ports_raw = request.form.get('ports', '1194').strip()
     cipher = request.form.get('cipher', 'AES-256-CBC')
     auth = request.form.get('auth', 'SHA256')
     comp = request.form.get('comp', 'yes')
-    ca_file = request.files.get('ca')
-    cert_file = request.files.get('cert')
-    key_file = request.files.get('key')
+    client_name = request.form.get('client_name', 'client').strip()
 
-    # Read certificates if uploaded
-    ca_cert = client_cert = client_key = ""
-    if ca_file and ca_file.filename:
-        ca_cert = ca_file.read().decode('utf-8')
-    if cert_file and cert_file.filename:
-        client_cert = cert_file.read().decode('utf-8')
-    if key_file and key_file.filename:
-        client_key = key_file.read().decode('utf-8')
+    if not server:
+        server = request.remote_addr  # fallback
 
     # Parse ports
     ports = [p.strip() for p in ports_raw.split(',') if p.strip().isdigit()]
     if not ports:
         ports = ["1194"]
 
-    # Generate for each combo
+    # Ensure CA exists
+    ensure_ca()
+    ca_cert = (CERT_DIR / "ca.crt").read_text()
+
     generated = []
-    for proto in protocols:
-        for port in ports:
-            name = f"client_{proto}_{port}"
-            out_path = generate_config(
-                server=server,
-                port=port,
-                proto=proto,
-                name=name,
-                ca_cert=ca_cert,
-                client_cert=client_cert,
-                client_key=client_key,
-                cipher=cipher,
-                auth=auth,
-                comp=comp
-            )
-            generated.append(str(out_path))
+    for port in ports:
+        name = f"{client_name}_{proto}_{port}"
+        # Generate client cert for each (or reuse)
+        client_cert_pem, client_key_pem = generate_client_cert(name)
+        out_path = generate_config(
+            name=name,
+            server=server,
+            port=port,
+            proto=proto,
+            cipher=cipher,
+            auth=auth,
+            comp=comp,
+            ca_cert=ca_cert,
+            client_cert=client_cert_pem,
+            client_key=client_key_pem
+        )
+        generated.append(str(out_path))
 
     return redirect(url_for('index'))
 
@@ -195,7 +250,6 @@ def download(name):
 
 @app.route('/download_all')
 def download_all():
-    # Create a zip with all configs
     zip_path = BASE_DIR / "all_configs.zip"
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for ovpn in CONFIG_DIR.glob("*.ovpn"):
@@ -209,102 +263,109 @@ def delete(name):
         file_path.unlink()
     return redirect(url_for('index'))
 
-# ---------------- HTML Template ----------------
+# ---------------- HTML Template (Clean UI) ----------------
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🐱 OVPN Config Forge</title>
+    <meta charset="UTF-8">
+    <title>OVPN Config Forge</title>
     <style>
-        body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #0f0; padding: 20px; }
-        .container { max-width: 1200px; margin: auto; }
-        h1 { color: #0f0; border-bottom: 2px solid #0f0; padding-bottom: 10px; }
-        .card { background: #1a1a1a; padding: 15px; margin: 15px 0; border: 1px solid #0f0; border-radius: 5px; }
-        .row { display: flex; gap: 20px; flex-wrap: wrap; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1200px; margin: auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); padding: 25px; }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-top: 0; }
+        h2 { color: #34495e; }
+        .row { display: flex; gap: 30px; flex-wrap: wrap; }
         .col { flex: 1; min-width: 300px; }
-        .btn { background: #0f0; color: #000; border: none; padding: 8px 16px; cursor: pointer; font-weight: bold; }
-        .btn:hover { background: #0a0; }
-        .btn-danger { background: #f00; color: #fff; }
-        .btn-danger:hover { background: #c00; }
-        input, select, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 5px; width: 100%; }
-        .status { color: #ff0; }
-        .status.active { color: #0f0; }
-        .status.inactive { color: #f00; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; font-weight: 600; margin-bottom: 5px; color: #2c3e50; }
+        input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+        .btn:hover { background: #2980b9; }
+        .btn-danger { background: #e74c3c; }
+        .btn-danger:hover { background: #c0392b; }
+        .btn-success { background: #2ecc71; }
+        .btn-success:hover { background: #27ae60; }
         .file-list { list-style: none; padding: 0; }
-        .file-list li { padding: 8px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
-        .file-info { font-size: 0.8em; color: #aaa; }
+        .file-list li { padding: 12px; border-bottom: 1px solid #ecf0f1; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+        .file-info { font-size: 0.9em; color: #7f8c8d; }
         .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-        .footer { margin-top: 30px; color: #666; font-size: 0.8em; }
+        .badge { background: #2ecc71; color: white; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; }
+        .badge.inactive { background: #e74c3c; }
+        .footer { margin-top: 30px; color: #95a5a6; font-size: 0.9em; border-top: 1px solid #ecf0f1; padding-top: 15px; }
+        .note { background: #f9f9f9; padding: 10px; border-left: 4px solid #3498db; margin: 10px 0; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🐱 OVPN Config Forge – Shadow</h1>
+    <h1>🐱 OVPN Config Forge</h1>
     <div class="row">
         <div class="col">
-            <div class="card">
-                <h2>⚙️ Generate New Configs</h2>
-                <form method="post" action="/generate" enctype="multipart/form-data">
-                    <label>Server IP / Hostname</label>
-                    <input type="text" name="server" placeholder="vpn.example.com" required>
-
-                    <label>Protocols</label>
-                    <label><input type="checkbox" name="protocols" value="udp" checked> UDP</label>
-                    <label><input type="checkbox" name="protocols" value="tcp" checked> TCP</label>
-
-                    <label>Ports (comma-separated)</label>
-                    <input type="text" name="ports" value="1194,443" placeholder="1194,443,8080">
-
-                    <label>Cipher</label>
-                    <select name="cipher">
-                        <option value="AES-256-CBC">AES-256-CBC</option>
-                        <option value="AES-256-GCM">AES-256-GCM</option>
-                        <option value="BF-CBC">BF-CBC</option>
-                    </select>
-
-                    <label>Auth</label>
-                    <select name="auth">
-                        <option value="SHA256">SHA256</option>
-                        <option value="SHA512">SHA512</option>
-                        <option value="SHA1">SHA1</option>
-                    </select>
-
-                    <label>Compression</label>
-                    <select name="comp">
-                        <option value="yes">yes</option>
-                        <option value="no">no</option>
-                        <option value="lzo">lzo</option>
-                    </select>
-
-                    <label>Upload CA Certificate (optional)</label>
-                    <input type="file" name="ca" accept=".crt,.pem,.txt">
-
-                    <label>Upload Client Certificate (optional)</label>
-                    <input type="file" name="cert" accept=".crt,.pem,.txt">
-
-                    <label>Upload Client Key (optional)</label>
-                    <input type="file" name="key" accept=".key,.pem,.txt">
-
+            <div class="card" style="background:#f9f9f9;padding:15px;border-radius:6px;">
+                <h2>⚙️ Generate Config</h2>
+                <form method="post" action="/generate">
+                    <div class="form-group">
+                        <label>Server IP / Hostname</label>
+                        <input type="text" name="server" placeholder="e.g., vpn.example.com" value="{{ server_ip }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Protocol</label>
+                        <select name="protocol">
+                            <option value="udp">UDP</option>
+                            <option value="tcp">TCP</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Ports (comma-separated)</label>
+                        <input type="text" name="ports" value="1194,443" placeholder="1194,443">
+                    </div>
+                    <div class="form-group">
+                        <label>Cipher</label>
+                        <select name="cipher">
+                            <option value="AES-256-CBC">AES-256-CBC</option>
+                            <option value="AES-256-GCM">AES-256-GCM</option>
+                            <option value="BF-CBC">BF-CBC</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Auth</label>
+                        <select name="auth">
+                            <option value="SHA256">SHA256</option>
+                            <option value="SHA512">SHA512</option>
+                            <option value="SHA1">SHA1</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Compression</label>
+                        <select name="comp">
+                            <option value="yes">yes</option>
+                            <option value="no">no</option>
+                            <option value="lzo">lzo</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Client Name (prefix)</label>
+                        <input type="text" name="client_name" value="client">
+                    </div>
                     <button class="btn" type="submit">🚀 Generate</button>
                 </form>
+                <div class="note">Certificates are auto‑generated on first run using OpenSSL.</div>
             </div>
         </div>
         <div class="col">
-            <div class="card">
-                <h2>📋 Generated Profiles <span style="font-size:0.7em;">({{ profiles|length }})</span></h2>
+            <div class="card" style="background:#f9f9f9;padding:15px;border-radius:6px;">
+                <h2>📋 Generated Profiles ({{ profiles|length }})</h2>
                 <div style="margin-bottom:10px;">
-                    <a href="/download_all" class="btn">⬇ Download All (ZIP)</a>
+                    <a href="/download_all" class="btn btn-success">⬇ Download All (ZIP)</a>
                 </div>
                 <ul class="file-list">
                     {% for p in profiles %}
                     <li>
                         <span>
                             <strong>{{ p.name }}</strong><br>
-                            <span class="file-info">
-                                {{ p.server }}:{{ p.port }} ({{ p.proto }}) – {{ p.created }} – {{ p.size }} bytes
-                            </span>
-                            <span class="status {% if p.active %}active{% else %}inactive{% endif %}">
-                                ● {% if p.active %}ACTIVE{% else %}INACTIVE{% endif %}
+                            <span class="file-info">{{ p.server }}:{{ p.port }} ({{ p.proto }}) – {{ p.created }} – {{ p.size }} bytes</span>
+                            <span class="badge {% if p.active %}active{% else %}inactive{% endif %}">
+                                {% if p.active %}● ACTIVE{% else %}● INACTIVE{% endif %}
                             </span>
                         </span>
                         <div class="actions">
@@ -315,13 +376,13 @@ HTML = """
                         </div>
                     </li>
                     {% else %}
-                    <li>No configs generated yet.</li>
+                    <li>No configs generated yet. Create one!</li>
                     {% endfor %}
                 </ul>
             </div>
         </div>
     </div>
-    <div class="footer">🐱 ShadowCat – root@universe | uptime ∞</div>
+    <div class="footer">🐱 ShadowCat – OpenVPN Config Forge v2 – Auto‑Cert Edition</div>
 </div>
 </body>
 </html>
@@ -329,9 +390,13 @@ HTML = """
 
 # ========== MAIN ==========
 if __name__ == "__main__":
-    # Ensure we have OpenVPN for status check (optional)
-    if not shutil.which("openvpn"):
-        print("⚠️ OpenVPN not installed – status checks will not work.", file=sys.stderr)
-        print("   Install: sudo apt install openvpn", file=sys.stderr)
-    print(f"🐱 OVPN Config Forge running on http://{HOST}:{PORT}")
+    # Check for openssl
+    if not shutil.which("openssl"):
+        print("❌ OpenSSL not found. Installing...", file=sys.stderr)
+        subprocess.check_call(["apt-get", "install", "-y", "openssl"])
+
+    # Generate CA on startup (if missing)
+    ensure_ca()
+
+    print(f"🐱 OVPN Config Forge v2 running on http://{HOST}:{PORT}")
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
