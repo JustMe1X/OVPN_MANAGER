@@ -19,7 +19,6 @@ try:
 except ImportError:
     print("🐱 Flask not found. Installing...", file=sys.stderr)
     subprocess.check_call([sys.executable, "-m", "pip", "install", "flask", "werkzeug"])
-    # Retry import after install
     from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
     from werkzeug.utils import secure_filename
 
@@ -243,7 +242,6 @@ def stop_vpn(name):
 if __name__ == "__main__":
     if os.geteuid() != 0:
         print("⚠️  WARNING: OpenVPN requires root. Run with sudo.", file=sys.stderr)
-    # Check if OpenVPN exists
     if not shutil.which("openvpn"):
         print("❌ OpenVPN not found. Install it: sudo apt install openvpn", file=sys.stderr)
         sys.exit(1)
