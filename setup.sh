@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OVPN Manager – Self‑Contained Venv Edition
-ShadowCat v5.0 – immune to externally‑managed errors
+OVPN Manager – System Package Edition
+ShadowCat v7.0 – no venv, no bullshit
 """
 import os
 import sys
@@ -9,35 +9,32 @@ import subprocess
 import shutil
 from pathlib import Path
 
-# ========== VENV BOOTSTRAP ==========
-VENV_DIR = Path("/opt/ovpn_manager_venv")
-VENV_PYTHON = VENV_DIR / "bin" / "python"
-VENV_PIP = VENV_DIR / "bin" / "pip"
+# ====== AUTO‑INSTALL FLASK VIA APT (if missing) ======
+def install_flask_system():
+    """Install flask/werkzeug using apt-get"""
+    if shutil.which("apt-get"):
+        print("🐱 Installing Flask & Werkzeug via apt...", file=sys.stderr)
+        try:
+            subprocess.check_call(["apt-get", "update"], stderr=subprocess.DEVNULL)
+            subprocess.check_call(["apt-get", "install", "-y", "python3-flask", "python3-werkzeug"])
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  apt install failed: {e}", file=sys.stderr)
+            return False
+    return False
 
-def bootstrap_venv():
-    """Create venv and install flask/werkzeug if missing"""
-    if not VENV_DIR.exists():
-        print("🐱 Creating virtual environment...", file=sys.stderr)
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-    # Check if flask is installed in venv
-    try:
-        subprocess.check_call([str(VENV_PYTHON), "-c", "import flask"], stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        print("🐱 Installing Flask & Werkzeug in venv...", file=sys.stderr)
-        subprocess.check_call([str(VENV_PIP), "install", "flask", "werkzeug"])
-
-# If we are not running inside the venv, re-execute inside it
-if sys.prefix != str(VENV_DIR):
-    bootstrap_venv()
-    print(f"🐱 Re‑executing inside venv: {VENV_PYTHON}", file=sys.stderr)
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON)] + sys.argv)
-
-# Now we are in the venv – proceed with the actual app
-from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
-from werkzeug.utils import secure_filename
-import json
-import time
-import signal
+# Try to import Flask, install if missing
+try:
+    from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
+    from werkzeug.utils import secure_filename
+except ImportError:
+    print("🐱 Flask not found. Attempting to install...", file=sys.stderr)
+    if not install_flask_system():
+        print("❌ Failed to install Flask. Please run: sudo apt install python3-flask python3-werkzeug", file=sys.stderr)
+        sys.exit(1)
+    # Retry import after install
+    from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
+    from werkzeug.utils import secure_filename
 
 # ========== CONFIGURATION ==========
 CONFIG_DIR = Path("/etc/openvpn/client")
@@ -52,6 +49,7 @@ for d in [CONFIG_DIR, UPLOAD_DIR, PID_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ========== STATE MANAGEMENT ==========
+import json, time, signal
 active_connections = {}
 
 def load_state():
