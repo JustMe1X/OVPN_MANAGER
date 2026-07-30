@@ -1,26 +1,43 @@
 #!/usr/bin/env python3
 """
-OVPN Manager – Web Panel for OpenVPN Configs
-ShadowCat Edition – GitHub Ready v4.2.0
+OVPN Manager – Self‑Contained Venv Edition
+ShadowCat v5.0 – immune to externally‑managed errors
 """
 import os
 import sys
 import subprocess
-import json
-import time
-import signal
 import shutil
 from pathlib import Path
 
-# ===== BOOTSTRAP: ensure Flask is installed =====
-try:
-    from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
-    from werkzeug.utils import secure_filename
-except ImportError:
-    print("🐱 Flask not found. Installing...", file=sys.stderr)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "flask", "werkzeug"])
-    from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
-    from werkzeug.utils import secure_filename
+# ========== VENV BOOTSTRAP ==========
+VENV_DIR = Path("/opt/ovpn_manager_venv")
+VENV_PYTHON = VENV_DIR / "bin" / "python"
+VENV_PIP = VENV_DIR / "bin" / "pip"
+
+def bootstrap_venv():
+    """Create venv and install flask/werkzeug if missing"""
+    if not VENV_DIR.exists():
+        print("🐱 Creating virtual environment...", file=sys.stderr)
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+    # Check if flask is installed in venv
+    try:
+        subprocess.check_call([str(VENV_PYTHON), "-c", "import flask"], stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print("🐱 Installing Flask & Werkzeug in venv...", file=sys.stderr)
+        subprocess.check_call([str(VENV_PIP), "install", "flask", "werkzeug"])
+
+# If we are not running inside the venv, re-execute inside it
+if sys.prefix != str(VENV_DIR):
+    bootstrap_venv()
+    print(f"🐱 Re‑executing inside venv: {VENV_PYTHON}", file=sys.stderr)
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON)] + sys.argv)
+
+# Now we are in the venv – proceed with the actual app
+from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
+from werkzeug.utils import secure_filename
+import json
+import time
+import signal
 
 # ========== CONFIGURATION ==========
 CONFIG_DIR = Path("/etc/openvpn/client")
@@ -31,7 +48,6 @@ OPENVPN_BIN = shutil.which("openvpn") or "/usr/sbin/openvpn"
 HOST = "0.0.0.0"
 PORT = 5000
 
-# Ensure directories exist
 for d in [CONFIG_DIR, UPLOAD_DIR, PID_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
